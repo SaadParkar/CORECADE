@@ -1,0 +1,303 @@
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+import { requireSupabaseAuth } from "@/lib/supabase/auth-middleware";
+
+const TimeStr = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:MM 24h");
+const CafeInput = z.object({
+  name: z.string().min(2).max(120),
+  slug: z.string().min(2).max(60).regex(/^[a-z0-9-]+$/, "lowercase letters, numbers, dashes only"),
+  city: z.string().max(80).optional().nullable(),
+  state: z.string().max(80).optional().nullable(),
+  address: z.string().max(500).optional().nullable(),
+  phone: z.string().max(20).optional().nullable(),
+  email: z.string().email().max(200).optional().nullable().or(z.literal("")),
+  description: z.string().max(1000).optional().nullable(),
+  open_time: TimeStr.optional().nullable(),
+  close_time: TimeStr.optional().nullable(),
+  open_days: z.array(z.number().int().min(0).max(6)).max(7).optional().nullable(),
+  // Optional — only super admins may set a different owner. Café owners auto-own.
+  owner_email: z.string().email().max(200).optional().nullable(),
+});
+
+export const listMyCafes = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data, error } = await context.supabase
+      .from("cafes")
+      .select("id, slug, name, city, is_active, owner_id, created_at")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data ?? [];
+  });
+
+export const getMyOwnedCafes = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data, error } = await context.supabase
+      .from("cafes")
+      .select("id, slug, name, city, is_active")
+      .eq("owner_id", context.userId)
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data ?? [];
+  });
+
+export const toggleCafeActive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ id: z.string().uuid(), is_active: z.boolean() }).parse(d))
+  .handler(async ({ data, context }) => {
+    const { error } = await context.supabase
+      .from("cafes").update({ is_active: data.is_active }).eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  });
+
+// Owner OR super admin can schedule maintenance for a cafe.
+// Pass nulls to clear the maintenance window.
+export const setCafeMaintenance = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z.object({
+      id: z.string().uuid(),
+      starts_at: z.string().datetime().nullable(),
+      ends_at: z.string().datetime().nullable(),
+      message: z.string().max(500).nullable(),
+    }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    // RLS on cafes already restricts to owner; super admin bypasses via has_role policy.
+    const { error } = await context.supabase
+      .from("cafes")
+      .update({
+        maintenance_starts_at: data.starts_at,
+        maintenance_ends_at: data.ends_at,
+        maintenance_message: data.message,
+      })
+      .eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  });
+
+export const getCafeMaintenance = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    const { data: row, error } = await context.supabase
+      .from("cafes")
+      .select("maintenance_starts_at, maintenance_ends_at, maintenance_message")
+      .eq("id", data.id)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return row;
+  });
+
+export const getCafeBySlug = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ slug: z.string() }).parse(d))
+  .handler(async ({ data, context }) => {
+    const { data: cafe, error } = await context.supabase
+      .from("cafes")
+      .select("*")
+      .eq("slug", data.slug)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!cafe) throw new Error("Café not found");
+    return cafe;
+  });
+
+export const createCafe = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => CafeInput.parse(d))
+  .handler(async ({ data, context }) => {
+    const { data: isAdmin } = await context.supabase.rpc("has_role", {
+      _user_id: context.userId, _role: "super_admin",
+    });
+    const { data: isOwner } = await context.supabase.rpc("has_role", {
+      _user_id: context.userId, _role: "cafe_owner",
+    });
+    if (!isAdmin && !isOwner) throw new Error("Forbidden — only café owners or admins can create cafés.");
+
+    const { supabaseAdmin } = await import("@/lib/supabase/client.server");
+
+    // Resolve owner. Café owners always own their own cafés.
+    let ownerId: string | undefined;
+    if (isAdmin && data.owner_email) {
+      const { data: profile } = await supabaseAdmin
+        .from("profiles").select("id").eq("email", data.owner_email).maybeSingle();
+      ownerId = profile?.id;
+      if (!ownerId) {
+        const { data: invited, error: invErr } =
+          await supabaseAdmin.auth.admin.inviteUserByEmail(data.owner_email);
+        if (invErr) throw new Error(invErr.message);
+        ownerId = invited.user?.id;
+      }
+    } else {
+      ownerId = context.userId;
+    }
+    if (!ownerId) throw new Error("Could not resolve owner");
+
+    // Unique slug guard
+    const { data: clash } = await supabaseAdmin
+      .from("cafes").select("id").eq("slug", data.slug).maybeSingle();
+    if (clash) throw new Error("That slug is taken — pick another.");
+
+    const { data: cafe, error } = await supabaseAdmin
+      .from("cafes")
+      .insert({
+        owner_id: ownerId,
+        slug: data.slug,
+        name: data.name,
+        city: data.city || null,
+        state: data.state || null,
+        address: data.address || null,
+        phone: data.phone || null,
+        email: data.email || null,
+        description: data.description || null,
+        open_time: data.open_time || null,
+        close_time: data.close_time || null,
+        open_days: data.open_days && data.open_days.length ? data.open_days : null,
+      })
+      .select().single();
+    if (error) throw new Error(error.message);
+
+    // Ensure cafe_owner role exists (scoped + global) — ignore duplicates
+    await supabaseAdmin.from("user_roles")
+      .insert({ user_id: ownerId, role: "cafe_owner", cafe_id: cafe.id });
+    await supabaseAdmin.from("user_roles")
+      .insert({ user_id: ownerId, role: "cafe_owner", cafe_id: null });
+
+    return cafe;
+  });
+
+export const updateCafe = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z.object({
+      id: z.string().uuid(),
+      patch: z.object({
+        name: z.string().min(2).max(120).optional(),
+        city: z.string().max(80).optional().nullable(),
+        state: z.string().max(80).optional().nullable(),
+        address: z.string().max(500).optional().nullable(),
+        phone: z.string().max(20).optional().nullable(),
+        email: z.string().max(200).optional().nullable(),
+        description: z.string().max(1000).optional().nullable(),
+        is_active: z.boolean().optional(),
+        floor_cols: z.number().int().min(4).max(40).optional(),
+        floor_rows: z.number().int().min(3).max(30).optional(),
+        latitude: z.number().min(-90).max(90).nullable().optional(),
+        longitude: z.number().min(-180).max(180).nullable().optional(),
+        gst_no: z.string().max(40).nullable().optional(),
+        default_gst_rate: z.number().min(0).max(50).optional(),
+      }),
+    }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { error } = await context.supabase
+      .from("cafes")
+      .update(data.patch)
+      .eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  });
+
+// Owner dashboard: per-café stats for everything the signed-in user owns.
+export const getOwnerDashboard = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabaseAdmin } = await import("@/lib/supabase/client.server");
+    const { data: cafes } = await supabaseAdmin
+      .from("cafes")
+      .select("id, slug, name, city, is_active, created_at, trial_ends_at, subscription_status, plan")
+      .eq("owner_id", context.userId)
+      .order("created_at", { ascending: true });
+
+    const list = cafes ?? [];
+    if (list.length === 0) {
+      return { cafes: [], totals: { revenue: 0, revenueToday: 0, bookings: 0, activeSessions: 0, devices: 0, customers: 0 } };
+    }
+    const ids = list.map((c) => c.id);
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+
+    const [devicesRes, customersRes, sessionsActiveRes, sessionsAllRes, sessionsTodayRes, bookingsRes] = await Promise.all([
+      supabaseAdmin.from("devices").select("id, cafe_id").in("cafe_id", ids),
+      supabaseAdmin.from("customers").select("id, cafe_id").in("cafe_id", ids),
+      supabaseAdmin.from("sessions").select("id, cafe_id").in("cafe_id", ids).eq("status", "active"),
+      supabaseAdmin.from("sessions").select("cafe_id, amount").in("cafe_id", ids).not("amount", "is", null),
+      supabaseAdmin.from("sessions").select("cafe_id, amount").in("cafe_id", ids).gte("started_at", startOfDay.toISOString()),
+      supabaseAdmin.from("bookings").select("id, cafe_id, status").in("cafe_id", ids),
+    ]);
+
+    const count = (rows: { cafe_id: string }[] | null) => {
+      const m = new Map<string, number>();
+      (rows ?? []).forEach((r) => m.set(r.cafe_id, (m.get(r.cafe_id) ?? 0) + 1));
+      return m;
+    };
+    const sum = (rows: { cafe_id: string; amount: number | null }[] | null) => {
+      const m = new Map<string, number>();
+      (rows ?? []).forEach((r) => m.set(r.cafe_id, (m.get(r.cafe_id) ?? 0) + (r.amount ?? 0)));
+      return m;
+    };
+
+    const dev = count(devicesRes.data); const cust = count(customersRes.data);
+    const act = count(sessionsActiveRes.data); const book = count(bookingsRes.data);
+    const rev = sum(sessionsAllRes.data); const revToday = sum(sessionsTodayRes.data);
+
+    const perCafe = list.map((c) => ({
+      id: c.id, slug: c.slug, name: c.name, city: c.city, is_active: c.is_active,
+      trial_ends_at: (c as { trial_ends_at?: string | null }).trial_ends_at ?? null,
+      subscription_status: (c as { subscription_status?: string | null }).subscription_status ?? null,
+      plan: (c as { plan?: string | null }).plan ?? null,
+      devices: dev.get(c.id) ?? 0,
+      customers: cust.get(c.id) ?? 0,
+      activeSessions: act.get(c.id) ?? 0,
+      bookings: book.get(c.id) ?? 0,
+      revenue: rev.get(c.id) ?? 0,
+      revenueToday: revToday.get(c.id) ?? 0,
+    }));
+
+    const totals = perCafe.reduce((a, c) => ({
+      revenue: a.revenue + c.revenue,
+      revenueToday: a.revenueToday + c.revenueToday,
+      bookings: a.bookings + c.bookings,
+      activeSessions: a.activeSessions + c.activeSessions,
+      devices: a.devices + c.devices,
+      customers: a.customers + c.customers,
+    }), { revenue: 0, revenueToday: 0, bookings: 0, activeSessions: 0, devices: 0, customers: 0 });
+
+    return { cafes: perCafe, totals };
+  });
+
+// Owner (or super admin) deletes their own café. Requires typed-slug confirmation.
+export const ownerDeleteCafe = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z.object({
+      id: z.string().uuid(),
+      confirm_slug: z.string().min(1).max(60),
+    }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { data: cafe, error: getErr } = await context.supabase
+      .from("cafes")
+      .select("id, slug, owner_id, name")
+      .eq("id", data.id)
+      .maybeSingle();
+    if (getErr) throw new Error(getErr.message);
+    if (!cafe) throw new Error("Café not found");
+
+    const { data: isAdmin } = await context.supabase.rpc("has_role", {
+      _user_id: context.userId, _role: "super_admin",
+    });
+    if (cafe.owner_id !== context.userId && !isAdmin) {
+      throw new Error("Only the café owner can delete this café.");
+    }
+    if (cafe.slug !== data.confirm_slug.trim()) {
+      throw new Error(`Type "${cafe.slug}" exactly to confirm deletion.`);
+    }
+
+    const { supabaseAdmin } = await import("@/lib/supabase/client.server");
+    const { error } = await supabaseAdmin.from("cafes").delete().eq("id", cafe.id);
+    if (error) throw new Error(error.message);
+    return { ok: true, name: cafe.name };
+  });
