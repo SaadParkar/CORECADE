@@ -20,11 +20,6 @@ not_found_handling = "single-page-application"
 # Public Supabase URL (also exposed to the browser as VITE_SUPABASE_URL at build time)
 # SUPABASE_URL = "https://nggaiqniweggifcjtoio.supabase.co"
 
-# ----------------------------------------------------------------------------
-# Production overrides (optional)
-# ----------------------------------------------------------------------------
-[env.production]
-name = "corecade"
 
 [observability]
 enabled = true
